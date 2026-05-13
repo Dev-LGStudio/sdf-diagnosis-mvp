@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { createClient } from '@supabase/supabase-js'
 import { buildSystemPrompt } from '@/lib/prompts'
 
-export const runtime = 'edge'
+export const runtime = 'nodejs'
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
