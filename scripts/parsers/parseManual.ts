@@ -82,7 +82,7 @@ export function parseManual(filePath: string): DmRecord[] {
 
     if (node.hasClass('section')) {
       const items: string[] = []
-      node.find('ol li').each((_j, li) => items.push($(li).text().trim()))
+      node.find('ol li').each((_j, li) => { items.push($(li).text().trim()) })
       if (items.length > 0) currentSectionPath = items
 
     } else if (node.hasClass('dmContainer')) {
