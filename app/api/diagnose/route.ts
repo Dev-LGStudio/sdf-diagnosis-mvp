@@ -60,14 +60,21 @@ function extractAlarmTokens(problem: string): { codes: string[]; ids: string[] }
   return { codes, ids }
 }
 
+// Strip characters that break websearch_to_tsquery: [ ] ( ) : | & ! * \ ' "
+function sanitizeFts(text: string): string {
+  return text.replace(/[\[\]():|\&!*\\'"`]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
 // Build an enriched FTS query from alarm context + original problem
 function buildModuleQuery(problem: string, alarms: AlarmRow[]): string {
-  if (alarms.length === 0) return problem
+  const base = sanitizeFts(problem)
+  if (alarms.length === 0) return base
   const alarmTerms = alarms
     .flatMap((a) => [a.component_en, a.description_en])
     .filter(Boolean)
+    .map((t) => sanitizeFts(t!))
     .join(' ')
-  return `${problem} ${alarmTerms}`.trim()
+  return `${base} ${alarmTerms}`.trim()
 }
 
 async function fetchAlarms(
@@ -117,12 +124,15 @@ async function fetchModules(
   modelCode: string,
   query: string
 ): Promise<DmRow[]> {
+  const safeQuery = sanitizeFts(query)
+  if (!safeQuery) return []
+
   const { data: ftsData } = await supabase
     .from('data_modules')
     .select('dm_code, dm_title, section_path, content, spare_parts, source_type')
     .eq('brand', brand)
     .eq('model_code', modelCode)
-    .textSearch('fts', query, { type: 'websearch' })
+    .textSearch('fts', safeQuery, { type: 'websearch' })
     .limit(6)
 
   const results: DmRow[] = ftsData ?? []
