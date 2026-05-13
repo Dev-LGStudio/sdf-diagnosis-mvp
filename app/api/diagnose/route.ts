@@ -36,13 +36,19 @@ type AlarmRow = {
   severity: string | null
 }
 
-// Detects SDF alarm codes like A1, B12, DTC123 in the problem text
-function extractAlarmCodes(problem: string): string[] {
-  const matches = problem.match(/\b[A-Z]{1,3}\d+\b/g) ?? []
-  return [...new Set(matches)]
+// Detects short codes (A1, B12) and full alarm IDs (ANTENNA_2420962)
+function extractAlarmTokens(problem: string): { codes: string[]; ids: string[] } {
+  const codes = [...new Set(problem.match(/\b[A-Z]{1,3}\d+\b/g) ?? [])]
+  const ids   = [...new Set(problem.match(/\b[A-Z][A-Z0-9]*_\d+\b/g) ?? [])]
+  return { codes, ids }
 }
 
-async function fetchModules(supabase: ReturnType<typeof getSupabase>, brand: string, modelCode: string, problem: string): Promise<DmRow[]> {
+async function fetchModules(
+  supabase: ReturnType<typeof getSupabase>,
+  brand: string,
+  modelCode: string,
+  problem: string
+): Promise<DmRow[]> {
   const { data: ftsData } = await supabase
     .from('data_modules')
     .select('dm_code, dm_title, section_path, content, spare_parts, source_type')
@@ -70,27 +76,43 @@ async function fetchModules(supabase: ReturnType<typeof getSupabase>, brand: str
   return results
 }
 
-async function fetchAlarms(supabase: ReturnType<typeof getSupabase>, modelCode: string, problem: string): Promise<AlarmRow[]> {
-  const codes = extractAlarmCodes(problem)
+async function fetchAlarms(
+  supabase: ReturnType<typeof getSupabase>,
+  modelCode: string,
+  problem: string
+): Promise<AlarmRow[]> {
+  const { codes, ids } = extractAlarmTokens(problem)
+  const select = 'alarm_code, alarm_id, component_en, component_it, description_en, description_it, actions_en, actions_it, severity'
 
-  // If explicit alarm codes found, prioritise exact match
-  if (codes.length > 0) {
+  // Exact match on alarm_code (A1) or alarm_id (ANTENNA_2420962)
+  if (codes.length > 0 || ids.length > 0) {
+    const filters: string[] = []
+    if (codes.length > 0) filters.push(`alarm_code.in.(${codes.join(',')})`)
+    if (ids.length > 0)   filters.push(`alarm_id.in.(${ids.join(',')})`)
+
     const { data } = await supabase
       .from('alarms')
-      .select('alarm_code, alarm_id, component_en, component_it, description_en, description_it, actions_en, actions_it, severity')
+      .select(select)
       .eq('model_code', modelCode)
-      .in('alarm_code', codes)
+      .or(filters.join(','))
       .limit(6)
+
     if (data && data.length > 0) return data
   }
 
-  // Fallback: full-text search on description + component
-  const keyword = problem.split(/\s+/).slice(0, 5).join(' | ')
+  // Fallback: ilike on significant words from the problem
+  const words = problem.split(/\s+/).filter((w) => w.length > 3).slice(0, 3)
+  if (words.length === 0) return []
+
+  const orFilter = words
+    .map((w) => `description_en.ilike.%${w}%,component_en.ilike.%${w}%`)
+    .join(',')
+
   const { data } = await supabase
     .from('alarms')
-    .select('alarm_code, alarm_id, component_en, component_it, description_en, description_it, actions_en, actions_it, severity')
+    .select(select)
     .eq('model_code', modelCode)
-    .or(`description_en.ilike.%${keyword}%,component_en.ilike.%${keyword}%`)
+    .or(orFilter)
     .limit(4)
 
   return data ?? []
@@ -114,7 +136,7 @@ function buildContext(modules: DmRow[], alarms: AlarmRow[]): string {
 
   for (const a of alarms) {
     parts.push([
-      `[Allarme] ${a.alarm_code} (${a.alarm_id}) — Severità: ${a.severity ?? 'N/D'}`,
+      `[Allarme] ${a.alarm_code} (${a.alarm_id}) — Severita: ${a.severity ?? 'N/D'}`,
       a.component_en ? `Componente: ${a.component_en}` : '',
       a.description_en ? `Descrizione: ${a.description_en}` : '',
       a.actions_en ? `Azioni tecnico: ${a.actions_en}` : '',
