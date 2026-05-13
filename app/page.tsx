@@ -11,6 +11,20 @@ const MODELS = [
     modelCode: 'LW1',
     modelDesc: '6125 C',
   },
+  {
+    brand: 'DEUTZ-FAHR',
+    familyCode: '242',
+    familyDesc: '6115-6125-6135 RVSHIFT T5F',
+    modelCode: 'LW8',
+    modelDesc: '6135 C RVSHIFT',
+  },
+  {
+    brand: 'DEUTZ-FAHR',
+    familyCode: '249',
+    familyDesc: '6115-6125-6135 TTV T5F',
+    modelCode: 'LW5',
+    modelDesc: '6135 C TTV',
+  },
 ]
 
 export default function HomePage() {
