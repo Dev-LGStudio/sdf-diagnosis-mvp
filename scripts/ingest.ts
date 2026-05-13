@@ -30,6 +30,8 @@ const familyDesc = $('div.info p.familyDescription').text().trim()
 const modelCode = $('div.info p.model').text().trim()
 const modelDesc = $('div.info p.modelDescription').text().trim()
 const docType = $('div.info div.docType').text().trim()
+const creationDate = $('div.info div.creationDate').text().trim()
+const updateDate = $('div.info div.updateDate').text().trim()
 
 console.log(`Brand: ${brand} | Model: ${modelCode} (${modelDesc})`)
 
@@ -47,6 +49,15 @@ type DmRecord = {
   model_code: string
   model_desc: string
   doc_type: string
+  creation_date: string
+  update_date: string
+  novepunto: string[]
+  tags: string[]
+  service_news: string
+}
+
+function splitList(raw: string): string[] {
+  return raw.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean)
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -58,14 +69,11 @@ function parseDm(dmEl: cheerio.Cheerio<any>, currentSectionPath: string[]): DmRe
 
   const dmVersion = dmEl.find('> div.dmVersion').text().trim()
   const explorerUrl = dmEl.find('> div.explorer').text().trim()
-
-  const sparePartsRaw = dmEl.find('> div.spareParts').text().trim()
-  const spareParts = sparePartsRaw
-    .split(/[\n,;]+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-
-  const content = dmEl.find('> div.content').text().trim()
+  const spareParts = splitList(dmEl.find('> div.spareParts').text().trim())
+  const novepunto = splitList(dmEl.find('> div.novepunto').text().trim())
+  const tags = splitList(dmEl.find('> div.tags').text().trim())
+  const content = dmEl.find('> div.content').html()?.trim() ?? ''
+  const serviceNews = dmEl.find('> div.serviceNews').html()?.trim() ?? ''
 
   return {
     dm_code: dmCode,
@@ -81,6 +89,11 @@ function parseDm(dmEl: cheerio.Cheerio<any>, currentSectionPath: string[]): DmRe
     model_code: modelCode,
     model_desc: modelDesc,
     doc_type: docType,
+    creation_date: creationDate,
+    update_date: updateDate,
+    novepunto,
+    tags,
+    service_news: serviceNews,
   }
 }
 
