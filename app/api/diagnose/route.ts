@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { createClient } from '@supabase/supabase-js'
 import { buildSystemPrompt } from '@/lib/prompts'
+import { detectAlarmCodes } from '@/lib/alarmDetector'
+import { lookupAlarms } from '@/lib/alarmLookup'
 
 export const runtime = 'nodejs'
 
@@ -10,189 +12,135 @@ const anthropic = new Anthropic({
 
 function getSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
   if (!url || !key) throw new Error('Missing Supabase env vars')
   return createClient(url, key)
 }
 
-type DmRow = {
-  dm_code: string
-  dm_title: string
-  section_path: string[] | null
-  content: string | null
-  spare_parts: string[] | null
-  source_type: string | null
+// ── Types ─────────────────────────────────────────────────────────────────────
+type ChunkRow = {
+  chunk_id:       string
+  dm_code:        string
+  dm_title:       string
+  chunk_heading:  string | null
+  chunk_text:     string
+  section_path:   string | null
+  spare_parts:    string[] | null
+  tools_required: string[] | null
+  dm_type:        string | null
+  system:         string | null
+  operation_type: string | null
+  doc_type:       string | null
+  explorer_url:   string | null
+  similarity:     number
 }
 
-type AlarmRow = {
-  alarm_code: string
-  alarm_id: string
-  spn: string | null
-  fmi: string | null
-  ecu: string | null
-  part_number: string | null
-  severity: string | null
-  component_en: string | null
-  component_it: string | null
-  description_en: string | null
-  description_it: string | null
-  full_text_en: string | null
-  full_text_it: string | null
-  actions_en: string | null
-  actions_it: string | null
-  customer_action_en: string | null
-  customer_action_it: string | null
+// ── Alarm context builder ─────────────────────────────────────────────────────
+function buildAlarmContext(alarms: any[]): string {
+  if (alarms.length === 0) return ''
+  const blocks = alarms.map((a) => [
+    `Display Code: ${a.display_code}`,
+    a.ecu            ? `ECU / Component: ${a.ecu}` : '',
+    a.severity       ? `Severity: ${a.severity}` : '',
+    a.component_en   ? `Component name: ${a.component_en}` : '',
+    `Component part number: ${a.part_number ? a.part_number : 'not available'}`,
+    a.description_en ? `Fault description: ${a.description_en}` : '',
+    a.actions_en     ? `Recommended actions: ${a.actions_en}` : '',
+    a.customers_en   ? `Customer message: ${a.customers_en}` : '',
+  ].filter(Boolean).join('\n'))
+
+  return [
+    'ALARM CODES DETECTED IN THE TECHNICIAN QUERY:',
+    blocks.join('\n---\n'),
+    'IMPORTANT: Use the alarm information above as PRIMARY context for your diagnosis.',
+    'Cross-reference it with the technical documentation chunks below.',
+  ].join('\n')
 }
 
-const ALARM_SELECT = [
-  'alarm_code', 'alarm_id', 'spn', 'fmi', 'ecu', 'part_number', 'severity',
-  'component_en', 'component_it',
-  'description_en', 'description_it',
-  'full_text_en', 'full_text_it',
-  'actions_en', 'actions_it',
-  'customer_action_en', 'customer_action_it',
-].join(', ')
-
-// Detects short codes (A1, B12) and full alarm IDs (ANTENNA_2420962)
-function extractAlarmTokens(problem: string): { codes: string[]; ids: string[] } {
-  const codes = [...new Set(problem.match(/\b[A-Z]{1,3}\d+\b/g) ?? [])]
-  const ids   = [...new Set(problem.match(/\b[A-Z][A-Z0-9]*_\d+\b/g) ?? [])]
-  return { codes, ids }
+// ── Embedding ─────────────────────────────────────────────────────────────────
+async function fetchEmbedding(text: string): Promise<number[]> {
+  const res = await fetch('https://api.voyageai.com/v1/embeddings', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.VOYAGE_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      input: [text],
+      model: 'voyage-3',
+      input_type: 'query',
+    }),
+  })
+  if (!res.ok) throw new Error(`Voyage AI error: ${res.status} ${await res.text()}`)
+  const data = await res.json()
+  return data.data[0].embedding
 }
 
-// Strip characters that break websearch_to_tsquery: [ ] ( ) : | & ! * \ ' "
-function sanitizeFts(text: string): string {
-  return text.replace(/[\[\]():|\&!*\\'"`]/g, ' ').replace(/\s+/g, ' ').trim()
-}
-
-// Build an enriched FTS query from alarm context + original problem
-function buildModuleQuery(problem: string, alarms: AlarmRow[]): string {
-  const base = sanitizeFts(problem)
-  if (alarms.length === 0) return base
-  const alarmTerms = alarms
-    .flatMap((a) => [a.component_en, a.description_en])
-    .filter(Boolean)
-    .map((t) => sanitizeFts(t!))
-    .join(' ')
-  return `${base} ${alarmTerms}`.trim()
-}
-
-async function fetchAlarms(
+// ── Vector search ─────────────────────────────────────────────────────────────
+async function fetchChunks(
   supabase: ReturnType<typeof getSupabase>,
-  modelCode: string,
-  problem: string
-): Promise<AlarmRow[]> {
-  const { codes, ids } = extractAlarmTokens(problem)
-
-  // Exact match on alarm_code (A1) or alarm_id (ANTENNA_2420962)
-  if (codes.length > 0 || ids.length > 0) {
-    const filters: string[] = []
-    if (codes.length > 0) filters.push(`alarm_code.in.(${codes.join(',')})`)
-    if (ids.length > 0)   filters.push(`alarm_id.in.(${ids.join(',')})`)
-
-    const { data } = await supabase
-      .from('alarms')
-      .select(ALARM_SELECT)
-      .eq('model_code', modelCode)
-      .or(filters.join(','))
-      .limit(6)
-
-    if (data && data.length > 0) return data as unknown as AlarmRow[]
-  }
-
-  // Fallback: ilike on significant words from the problem
-  const words = problem.split(/\s+/).filter((w) => w.length > 3).slice(0, 3)
-  if (words.length === 0) return []
-
-  const orFilter = words
-    .map((w) => `description_en.ilike.%${w}%,component_en.ilike.%${w}%`)
-    .join(',')
-
-  const { data: fallbackData } = await supabase
-    .from('alarms')
-    .select(ALARM_SELECT)
-    .eq('model_code', modelCode)
-    .or(orFilter)
-    .limit(4)
-
-  return (fallbackData ?? []) as unknown as AlarmRow[]
-}
-
-async function fetchModules(
-  supabase: ReturnType<typeof getSupabase>,
+  embedding: number[],
   brand: string,
   modelCode: string,
-  query: string
-): Promise<DmRow[]> {
-  const safeQuery = sanitizeFts(query)
-  if (!safeQuery) return []
+): Promise<ChunkRow[]> {
+  console.log('[diagnose] embedding length:', embedding?.length)
 
-  const { data: ftsData } = await supabase
-    .from('data_modules')
-    .select('dm_code, dm_title, section_path, content, spare_parts, source_type')
-    .eq('brand', brand)
-    .eq('model_code', modelCode)
-    .textSearch('fts', safeQuery, { type: 'websearch' })
-    .limit(6)
+  const { data: chunks, error } = await supabase.rpc('match_chunks', {
+    query_embedding: `[${embedding.join(',')}]`,
+    match_count: 8,
+    filter_brand:    brand     || null,
+    filter_model:    modelCode || null,
+    filter_doc_type: null,
+    filter_system:   null,
+  })
 
-  const results: DmRow[] = ftsData ?? []
+  console.log('[diagnose] rpc error:', error)
+  console.log('[diagnose] chunks trovati:', chunks?.length)
 
-  if (results.length < 3) {
-    const { data: fallback } = await supabase
-      .from('data_modules')
-      .select('dm_code, dm_title, section_path, content, spare_parts, source_type')
-      .eq('brand', brand)
-      .eq('model_code', modelCode)
-      .limit(4)
-
-    const existing = new Set(results.map((r) => r.dm_code))
-    for (const row of fallback ?? []) {
-      if (!existing.has(row.dm_code)) results.push(row)
-    }
-  }
-
-  return results
+  return (chunks ?? []) as ChunkRow[]
 }
 
-function buildContext(modules: DmRow[], alarms: AlarmRow[]): string {
+// ── Context builder ───────────────────────────────────────────────────────────
+function buildContext(chunks: ChunkRow[]): string {
   const parts: string[] = []
 
-  for (const a of alarms) {
-    const block = [
-      `[Allarme] Codice: ${a.alarm_code} | ID: ${a.alarm_id}`,
-      a.severity      ? `Severita: ${a.severity}` : '',
-      a.ecu           ? `ECU: ${a.ecu}` : '',
-      a.spn           ? `SPN: ${a.spn}` : '',
-      a.fmi           ? `FMI: ${a.fmi}` : '',
-      a.part_number   ? `Part Number: ${a.part_number}` : '',
-      a.component_en  ? `Componente (EN): ${a.component_en}` : '',
-      a.component_it  ? `Componente (IT): ${a.component_it}` : '',
-      a.description_en ? `Descrizione (EN): ${a.description_en}` : '',
-      a.description_it ? `Descrizione (IT): ${a.description_it}` : '',
-      a.actions_en    ? `Azioni tecnico (EN): ${a.actions_en}` : '',
-      a.actions_it    ? `Azioni tecnico (IT): ${a.actions_it}` : '',
-      a.customer_action_en ? `Info cliente (EN): ${a.customer_action_en}` : '',
-      a.customer_action_it ? `Info cliente (IT): ${a.customer_action_it}` : '',
-    ].filter(Boolean).join('\n')
-    parts.push(block)
-  }
+  for (const c of chunks) {
+    const title  = c.chunk_heading ? `${c.dm_title} — ${c.chunk_heading}` : c.dm_title
+    const label  = c.doc_type === 'WORKSHOP MANUAL' ? 'Workshop Manual' : 'Operator Manual'
+    const spare  = c.spare_parts?.join(', ') ?? ''
+    const tools  = c.tools_required?.join(', ') ?? ''
+    const content = (c.chunk_text ?? '').slice(0, 1200)
 
-  for (const r of modules) {
-    const label = r.source_type === 'operator_manual' ? 'Manuale Uso e Manutenzione' : 'Manuale Officina'
-    const section = r.section_path?.join(' > ') ?? ''
-    const content = (r.content ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 800)
-    const spare = r.spare_parts?.join(', ') ?? ''
     parts.push([
-      `[${label}] DM: ${r.dm_code} — ${r.dm_title}`,
-      section ? `Sezione: ${section}` : '',
-      content ? `Contenuto: ${content}` : '',
-      spare   ? `Ricambi: ${spare}` : '',
+      `[${label}] DM: ${c.dm_code} — ${title}`,
+      c.section_path   ? `Section: ${c.section_path}` : '',
+      c.system         ? `System: ${c.system}` : '',
+      c.operation_type ? `Operation: ${c.operation_type}` : '',
+      content          ? `Content: ${content}` : '',
+      spare            ? `Spare parts: ${spare}` : '',
+      tools            ? `Tools required: ${tools}` : '',
     ].filter(Boolean).join('\n'))
   }
 
   return parts.join('\n\n---\n\n')
 }
 
+// ── DM references ────────────────────────────────────────────────────────────
+function buildDmReferences(chunks: ChunkRow[]): string {
+  const seen = new Set<string>()
+  const lines: string[] = []
+  for (const c of chunks) {
+    if (seen.has(c.dm_code)) continue
+    seen.add(c.dm_code)
+    const label = c.explorer_url
+      ? `- ${c.dm_code} — ${c.dm_title} | Explorer: ${c.explorer_url}`
+      : `- ${c.dm_code} — ${c.dm_title}`
+    lines.push(label)
+  }
+  return lines.join('\n')
+}
+
+// ── POST handler ──────────────────────────────────────────────────────────────
 export async function POST(req: Request) {
   const { problem, brand, modelCode } = await req.json()
 
@@ -202,20 +150,35 @@ export async function POST(req: Request) {
 
   const supabase = getSupabase()
 
-  // Fetch alarms first — they enrich the module search query
-  const alarms = await fetchAlarms(supabase, modelCode, problem)
-  const moduleQuery = buildModuleQuery(problem, alarms)
-  const modules = await fetchModules(supabase, brand, modelCode, moduleQuery)
+  const alarmCodes = detectAlarmCodes(problem)
+  console.log('[diagnose] alarm codes detected:', alarmCodes)
 
-  const context = buildContext(modules, alarms)
+  const [embedding, alarms] = await Promise.all([
+    fetchEmbedding(problem),
+    alarmCodes.length > 0 ? lookupAlarms(alarmCodes, modelCode) : Promise.resolve([]),
+  ])
+  console.log('[diagnose] alarms found:', alarms.length)
 
-  const userMessage = context
-    ? `Problema riportato dal tecnico:\n${problem}\n\nDocumentazione tecnica disponibile:\n${context}`
-    : `Problema riportato dal tecnico:\n${problem}\n\n(Nessuna documentazione specifica trovata per questo modello.)`
+  const chunks       = await fetchChunks(supabase, embedding, brand, modelCode)
+  const alarmContext = buildAlarmContext(alarms)
+  console.log('[diagnose] alarm context:', alarmContext)
+  const context      = buildContext(chunks)
+  const dmReferences = buildDmReferences(chunks)
+
+  const refSection = dmReferences
+    ? `\n\nDM references with Explorer links (use these exact URLs in the "Riferimenti DM" section):\n${dmReferences}`
+    : ''
+
+  const userMessage = [
+    `Problem reported by technician:\n${problem}`,
+    alarmContext ? alarmContext : null,
+    context      ? `Available technical documentation:\n${context}` : '(No specific documentation found for this model.)',
+    refSection   ? refSection : null,
+  ].filter(Boolean).join('\n\n')
 
   const stream = anthropic.messages.stream({
     model: 'claude-sonnet-4-6',
-    max_tokens: 1024,
+    max_tokens: 4096,
     system: buildSystemPrompt(brand, modelCode),
     messages: [{ role: 'user', content: userMessage }],
   })
